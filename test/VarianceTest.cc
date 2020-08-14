@@ -10,8 +10,9 @@
  * - eb_aom_variance{4-128}x{4-128}_{c,sse2,avx2}
  * - eb_aom_get_mb_ss_sse2
  * - aom_mse16x16_{c,avx2}
+ * - highbd_variance64_{c,avx2}
  *
- * @author Cidana-Ryan
+ * @author Cidana-Ryan,Cidana-Ivy
  *
  ******************************************************************************/
 #include <math.h>
@@ -36,29 +37,17 @@ using svt_av1_test_tool::SVTRandom;  // to generate the random
 namespace {
 #define MAX_BLOCK_SIZE (128 * 128)
 
-// MSE test
-static uint32_t mse_ref(const uint8_t *src, const uint8_t *ref, int width,
-                        int height, int src_stride, int ref_stride,
-                        uint32_t *sse_ptr) {
-    int64_t se = 0;
-    uint64_t sse = 0;
-    for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-            int diff;
-            diff = src[y * src_stride + x] - ref[y * ref_stride + x];
-            se += diff;
-            sse += diff * diff;
-        }
-    }
-    *sse_ptr = static_cast<uint32_t>(sse);
-    return static_cast<uint32_t>(sse - ((se * se) / (width * height)));
-}
-
 using MSE_NXM_FUNC = uint32_t (*)(const uint8_t *src_ptr, int32_t src_stride,
                                   const uint8_t *ref_ptr, int32_t ref_stride,
                                   uint32_t *sse);
 
-typedef std::tuple<uint32_t, uint32_t, MSE_NXM_FUNC> TestMseParam;
+using MSE_HIGHBD_NXM_FUNC = void (*)(const uint8_t *src_ptr, int32_t src_stride,
+                                  const uint8_t *ref_ptr, int32_t ref_stride,
+                                  uint32_t *sse);
+
+typedef std::tuple<uint32_t, uint32_t, MSE_NXM_FUNC, MSE_NXM_FUNC> TestMseParam;
+typedef std::tuple<uint32_t, uint32_t, MSE_HIGHBD_NXM_FUNC, MSE_HIGHBD_NXM_FUNC>
+    TestMseParamHighbd;
 /**
  * @brief Unit test for mse functions, target functions include:
  *  - aom_mse16x16_{c,avx2}
@@ -82,7 +71,8 @@ class MseTest : public ::testing::TestWithParam<TestMseParam> {
     MseTest()
         : width_(TEST_GET_PARAM(0)),
           height_(TEST_GET_PARAM(1)),
-          mse_tst_(TEST_GET_PARAM(2)) {
+          mse_tst_(TEST_GET_PARAM(2)),
+          mse_ref_(TEST_GET_PARAM(3)) {
         src_data_ =
             reinterpret_cast<uint8_t *>(eb_aom_memalign(32, MAX_BLOCK_SIZE));
         ref_data_ =
@@ -106,14 +96,8 @@ class MseTest : public ::testing::TestWithParam<TestMseParam> {
             }
 
             uint32_t sse_tst, sse_ref;
-            mse_tst_(src_data_, width_, ref_data_, width_, &sse_tst);
-            mse_ref(src_data_,
-                    ref_data_,
-                    width_,
-                    height_,
-                    width_,
-                    width_,
-                    &sse_ref);
+            mse_tst_(src_data_, width_, ref_data_, height_, &sse_tst);
+            mse_ref_(src_data_, width_, ref_data_, height_, &sse_ref);
             ASSERT_EQ(sse_tst, sse_ref) << "SSE Error at index: " << i;
         }
     }
@@ -133,6 +117,7 @@ class MseTest : public ::testing::TestWithParam<TestMseParam> {
     uint32_t width_;
     uint32_t height_;
     MSE_NXM_FUNC mse_tst_;
+    MSE_NXM_FUNC mse_ref_;
 };
 
 TEST_P(MseTest, MatchTest) {
@@ -145,7 +130,89 @@ TEST_P(MseTest, MaxTest) {
 
 INSTANTIATE_TEST_CASE_P(Variance, MseTest,
                         ::testing::Values(TestMseParam(16, 16,
-                                                       &eb_aom_mse16x16_avx2)));
+                                                       &eb_aom_mse16x16_avx2,
+                                                       &eb_aom_mse16x16_c)));
+
+class MseTestHighbd : public ::testing::TestWithParam<TestMseParamHighbd> {
+  public:
+    MseTestHighbd()
+        : width_(TEST_GET_PARAM(0)),
+          height_(TEST_GET_PARAM(1)),
+          mse_tst_(TEST_GET_PARAM(2)),
+          mse_ref_(TEST_GET_PARAM(3)) {
+          src_data_ =
+            reinterpret_cast<uint16_t *>(eb_aom_memalign(32, MAX_BLOCK_SIZE * 2));
+          ref_data_ =
+            reinterpret_cast<uint16_t *>(eb_aom_memalign(32, MAX_BLOCK_SIZE * 2));
+    }
+
+    ~MseTestHighbd() {
+        eb_aom_free(src_data_);
+        src_data_ = nullptr;
+        eb_aom_free(ref_data_);
+        ref_data_ = nullptr;
+    }
+
+    void run_match_test() {
+        const int32_t mask = (1 << 8) - 1;
+        SVTRandom rnd(0, mask);
+        for (int i = 0; i < 10; ++i) {
+            for (int j = 0; j < MAX_BLOCK_SIZE; ++j) {
+                src_data_[j] = rnd.random();
+                ref_data_[j] = rnd.random();
+            }
+
+            uint32_t sse_tst, sse_ref;
+
+            mse_ref_(CONVERT_TO_BYTEPTR(src_data_), width_,
+                     CONVERT_TO_BYTEPTR(ref_data_), height_,
+                     &sse_ref);
+            mse_tst_(CONVERT_TO_BYTEPTR(src_data_), width_,
+                     CONVERT_TO_BYTEPTR(ref_data_), height_,
+                     &sse_tst);
+            ASSERT_EQ(sse_tst, sse_ref) << "SSE Error at index: " << i;
+        }
+    }
+
+    void run_max_test() {
+        for (int j = 0; j < MAX_BLOCK_SIZE; ++j) {
+            src_data_[j] = 255;
+            ref_data_[j] = 0;
+        }
+        uint32_t sse_tst, sse_ref;
+
+        mse_ref_(CONVERT_TO_BYTEPTR(src_data_), width_,
+                 CONVERT_TO_BYTEPTR(ref_data_), height_,
+                 &sse_ref);
+        mse_tst_(CONVERT_TO_BYTEPTR(src_data_), width_,
+                 CONVERT_TO_BYTEPTR(ref_data_), height_,
+                 &sse_tst);
+
+        ASSERT_EQ(sse_tst, sse_ref) << "Error at MSE maximum test ";
+    }
+
+  private:
+    uint16_t *src_data_;
+    uint16_t *ref_data_;
+    uint32_t width_;
+    uint32_t height_;
+    MSE_HIGHBD_NXM_FUNC mse_tst_;
+    MSE_HIGHBD_NXM_FUNC mse_ref_;
+};
+
+TEST_P(MseTestHighbd, MatchTest) {
+    run_match_test();
+};
+
+TEST_P(MseTestHighbd, MaxTest) {
+    run_max_test();
+};
+
+INSTANTIATE_TEST_CASE_P(Variance, MseTestHighbd,
+                        ::testing::Values(TestMseParamHighbd(16, 16,
+                                                             &eb_aom_highbd_8_mse16x16_sse2,
+                                                             &eb_aom_highbd_8_mse16x16_c)));
+
 
 // sum of squares test
 static uint32_t mb_ss_ref(const int16_t *src) {
@@ -213,10 +280,11 @@ TEST_P(SumSquareTest, ConstTest) {
 TEST_P(SumSquareTest, MatchTest) {
     run_match_test();
 };
-
+#if !REMOVE_UNUSED_CODE
 extern "C" uint32_t eb_aom_get_mb_ss_sse2(const int16_t *src);
 INSTANTIATE_TEST_CASE_P(Variance, SumSquareTest,
                         ::testing::Values(eb_aom_get_mb_ss_sse2));
+#endif
 
 // Variance test
 using VARIANCE_NXM_FUNC = uint32_t (*)(const uint8_t *src_ptr,
@@ -341,19 +409,30 @@ INSTANTIATE_TEST_CASE_P(
         VarianceParam(8, 32, &eb_aom_variance8x32_c, &eb_aom_variance8x32_sse2),
         VarianceParam(16, 4, &eb_aom_variance16x4_c, &eb_aom_variance16x4_avx2),
         VarianceParam(16, 8, &eb_aom_variance16x8_c, &eb_aom_variance16x8_avx2),
-        VarianceParam(16, 16, &eb_aom_variance16x16_c, &eb_aom_variance16x16_avx2),
-        VarianceParam(16, 32, &eb_aom_variance16x32_c, &eb_aom_variance16x32_avx2),
-        VarianceParam(16, 64, &eb_aom_variance16x64_c, &eb_aom_variance16x64_avx2),
+        VarianceParam(16, 16, &eb_aom_variance16x16_c,
+                      &eb_aom_variance16x16_avx2),
+        VarianceParam(16, 32, &eb_aom_variance16x32_c,
+                      &eb_aom_variance16x32_avx2),
+        VarianceParam(16, 64, &eb_aom_variance16x64_c,
+                      &eb_aom_variance16x64_avx2),
         VarianceParam(32, 8, &eb_aom_variance32x8_c, &eb_aom_variance32x8_avx2),
-        VarianceParam(32, 16, &eb_aom_variance32x16_c, &eb_aom_variance32x16_avx2),
-        VarianceParam(32, 32, &eb_aom_variance32x32_c, &eb_aom_variance32x32_avx2),
-        VarianceParam(32, 64, &eb_aom_variance32x64_c, &eb_aom_variance32x64_avx2),
-        VarianceParam(64, 16, &eb_aom_variance64x16_c, &eb_aom_variance64x16_avx2),
-        VarianceParam(64, 32, &eb_aom_variance64x32_c, &eb_aom_variance64x32_avx2),
-        VarianceParam(64, 64, &eb_aom_variance64x64_c, &eb_aom_variance64x64_avx2),
-        VarianceParam(64, 128, &eb_aom_variance64x128_c, &eb_aom_variance64x128_avx2),
-        VarianceParam(128, 64, &eb_aom_variance128x64_c, &eb_aom_variance128x64_avx2),
+        VarianceParam(32, 16, &eb_aom_variance32x16_c,
+                      &eb_aom_variance32x16_avx2),
+        VarianceParam(32, 32, &eb_aom_variance32x32_c,
+                      &eb_aom_variance32x32_avx2),
+        VarianceParam(32, 64, &eb_aom_variance32x64_c,
+                      &eb_aom_variance32x64_avx2),
+        VarianceParam(64, 16, &eb_aom_variance64x16_c,
+                      &eb_aom_variance64x16_avx2),
+        VarianceParam(64, 32, &eb_aom_variance64x32_c,
+                      &eb_aom_variance64x32_avx2),
+        VarianceParam(64, 64, &eb_aom_variance64x64_c,
+                      &eb_aom_variance64x64_avx2),
+        VarianceParam(64, 128, &eb_aom_variance64x128_c,
+                      &eb_aom_variance64x128_avx2),
+        VarianceParam(128, 64, &eb_aom_variance128x64_c,
+                      &eb_aom_variance128x64_avx2),
         VarianceParam(128, 128, &eb_aom_variance128x128_c,
                       &eb_aom_variance128x128_avx2)));
-
 }  // namespace
+

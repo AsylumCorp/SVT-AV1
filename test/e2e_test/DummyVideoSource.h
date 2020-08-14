@@ -22,9 +22,11 @@ namespace svt_av1_video_source {
 
 #define FRAME_PER_LOOP 300
 
-static const uint8_t color_bar_luma[8] = {255, 173, 131, 115, 96, 83, 34, 0};
-static const uint8_t color_bar_cb[8] = {128, 52, 161, 87, 151, 80, 214, 128};
-static const uint8_t color_bar_cr[8] = {128, 137, 34, 45, 198, 205, 134, 128};
+static const uint8_t color_bar[3][8] = {
+    {255, 173, 131, 115, 96, 83, 34, 0},   /**< luma */
+    {128, 52, 161, 87, 151, 80, 214, 128}, /**< cb */
+    {128, 137, 34, 45, 198, 205, 134, 128} /**< cr */
+};
 
 class DummyVideoSource : public VideoSource {
   public:
@@ -33,22 +35,32 @@ class DummyVideoSource : public VideoSource {
                      const bool use_compressed_2bit_plan_output)
         : VideoSource(format, width, height, bit_depth,
                       use_compressed_2bit_plan_output) {
-        if (width_ % 16 != 0)
-            width_with_padding_ = ((width_ >> 4) + 1) << 4;
-        if (height_ % 16 != 0)
-            height_with_padding_ = ((height_ >> 4) + 1) << 4;
+        src_name_ = "Dummy Source";
+        memset(single_line_pattern, 0, sizeof(single_line_pattern));
     }
 
     virtual ~DummyVideoSource() {
-        deinit_frame_buffer();
+        for (size_t i = 0; i < 3; i++) {
+            if (single_line_pattern[i])
+                delete[] single_line_pattern[i];
+        }
     }
 
     EbErrorType open_source(const uint32_t init_pos,
                             const uint32_t frame_count) override {
-        if (image_format_ != IMG_FMT_420) {
-            printf("Open dummy source error, support YUV420 8bit only\r\n");
-            return EB_ErrorBadParameter;
+        cal_yuv_plane_param();
+
+        // create color bar parttern of single line
+        const uint32_t luma_size = width_with_padding_ * height_with_padding_;
+        for (int i = 0; i < 3; i++) {
+            single_line_pattern[i] = new uint8_t[luma_size * bytes_per_sample_];
+            if (bytes_per_sample_ > 1)
+                create_pattern((uint16_t *)single_line_pattern[i], i);
+            else
+                create_pattern(single_line_pattern[i], i);
         }
+
+        init_frame_buffer();
 
         init_pos_ = init_pos;
         if (frame_count == 0)
@@ -57,13 +69,16 @@ class DummyVideoSource : public VideoSource {
             frame_count_ = frame_count;
 
         current_frame_index_ = -1;
-        init_frame_buffer();
-
         return EB_ErrorNone;
     }
 
     /*!\brief Close stream. */
     void close_source() override {
+        for (size_t i = 0; i < 3; i++) {
+            if (single_line_pattern[i])
+                delete[] single_line_pattern[i];
+        }
+        memset(single_line_pattern, 0, sizeof(single_line_pattern));
         deinit_frame_buffer();
     }
 
@@ -71,8 +86,10 @@ class DummyVideoSource : public VideoSource {
     EbSvtIOFormat *get_next_frame() override {
         if ((uint32_t)(current_frame_index_ + 1) >= frame_count_)
             return nullptr;
+
+        // current_frame_index_ is start from -1, here plus 1 before generate
+        generate_frame(current_frame_index_ + 1 + init_pos_);
         current_frame_index_++;
-        generate_frame(current_frame_index_ + init_pos_);
         return frame_buffer_;
     }
 
@@ -80,67 +97,75 @@ class DummyVideoSource : public VideoSource {
     EbSvtIOFormat *get_frame_by_index(const uint32_t index) override {
         if (index >= frame_count_)
             return nullptr;
+        generate_frame(index + init_pos_);
         current_frame_index_ = index;
-        generate_frame(current_frame_index_ + init_pos_);
         return frame_buffer_;
     }
 
   protected:
-    void generate_frame(const uint32_t index) {
-        // generate a color bar pattern, moving with FRAME_PER_LOOP frame as one
-        // loop.
-        const uint32_t single_width = width_with_padding_ / 8;
-        uint8_t *src_p = nullptr;
-        uint8_t *p = nullptr;
-        uint32_t offset = 0;
+    template <typename Sample>
+    void create_pattern(Sample *buf, int plane_index) {
+        uint32_t bar_width = width_with_padding_ / 8;
+        if (plane_index > 0)
+            bar_width = bar_width >> width_downsize_;
 
-        offset =
+        for (int i = 0; i < 8; i++) {
+            Sample value =
+                ((Sample)color_bar[plane_index][i] << (bit_depth_ - 8));
+            for (uint32_t c = 0; c < bar_width; c++)
+                buf[i * bar_width + c] = value;
+        }
+    }
+
+    void generate_frame(const uint32_t index) {
+        // generate a color bar pattern, moving with FRAME_PER_LOOP frame as
+        // one loop.
+        uint8_t *src_p = nullptr;
+
+        uint32_t luma_offset =
             (index % FRAME_PER_LOOP) * width_with_padding_ / FRAME_PER_LOOP;
-        offset -= offset % 2;
-        // Support yuv420 8bit only.
+        if (width_downsize_ > 0)
+            luma_offset -= luma_offset % 2;
+        luma_offset *= bytes_per_sample_;
+        uint32_t width_in_byte = width_with_padding_ * bytes_per_sample_;
+
         // luma
         src_p = frame_buffer_->luma;
-        p = src_p + offset;
-
-        for (int r = 0; r < 8; r++) {
-            memset(p, color_bar_luma[r], single_width);
-            p += single_width;
-        }
-        memcpy(src_p, src_p + width_with_padding_, offset);
-        p = src_p;
-        for (uint32_t l = 1; l < height_with_padding_; l++) {
-            memcpy(p, src_p, width_with_padding_);
-            p += width_with_padding_;
+        memcpy(src_p + luma_offset, single_line_pattern[0], width_in_byte);
+        memcpy(src_p, src_p + width_in_byte, luma_offset);
+        for (uint32_t l = 0; l < height_with_padding_; l++) {
+            memcpy(src_p, frame_buffer_->luma, width_in_byte);
+            src_p += width_in_byte;
         }
 
+        const uint32_t chroma_offset = luma_offset >> width_downsize_;
+        const uint32_t chroma_width_in_byte = width_in_byte >> width_downsize_;
+        const uint32_t chroma_height = height_with_padding_ >> height_downsize_;
         // cb
         src_p = frame_buffer_->cb;
-        p = src_p + offset / 2;
-        for (int r = 0; r < 8; r++) {
-            memset(p, color_bar_cb[r], single_width / 2);
-            p += single_width / 2;
-        }
-        memcpy(src_p, src_p + width_with_padding_ / 2, offset / 2);
-        p = src_p;
-        for (uint32_t l = 1; l < height_with_padding_ / 2; l++) {
-            memcpy(p, src_p, width_with_padding_ / 2);
-            p += width_with_padding_ / 2;
+        memcpy(src_p + chroma_offset,
+               single_line_pattern[1],
+               chroma_width_in_byte);
+        memcpy(src_p, src_p + chroma_width_in_byte, chroma_offset);
+        for (uint32_t l = 0; l < chroma_height; l++) {
+            memcpy(src_p, frame_buffer_->cb, chroma_width_in_byte);
+            src_p += chroma_width_in_byte;
         }
 
         // cr
         src_p = frame_buffer_->cr;
-        p = src_p + offset / 2;
-        for (int r = 0; r < 8; r++) {
-            memset(p, color_bar_cr[r], single_width / 2);
-            p += single_width / 2;
-        }
-        memcpy(src_p, src_p + width_with_padding_ / 2, offset / 2);
-        p = src_p;
-        for (uint32_t l = 0; l < height_with_padding_ / 2; l++) {
-            memcpy(p, src_p, width_with_padding_ / 2);
-            p += width_with_padding_ / 2;
+        memcpy(src_p + chroma_offset,
+               single_line_pattern[2],
+               chroma_width_in_byte);
+        memcpy(src_p, src_p + chroma_width_in_byte, chroma_offset);
+        for (uint32_t l = 0; l < chroma_height; l++) {
+            memcpy(src_p, frame_buffer_->cr, chroma_width_in_byte);
+            src_p += chroma_width_in_byte;
         }
     }
+
+  protected:
+    uint8_t *single_line_pattern[3];
 };
 }  // namespace svt_av1_video_source
 #endif  //_SVT_TEST_DUMMY_VIDEO_SOURCE_H_
